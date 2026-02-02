@@ -2,7 +2,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, BigInteger
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr
@@ -54,8 +54,8 @@ class User(Base):
     hashed_password = Column(String)
     full_name = Column(String)
     is_active = Column(Boolean, default=True)
-    storage_used = Column(Integer, default=0)  # in bytes
-    storage_limit = Column(Integer, default=10737418240)  # 10GB default
+    storage_used = Column(BigInteger, default=0)  # FIX: Changed to BigInteger
+    storage_limit = Column(BigInteger, default=10737418240)  # FIX: Changed to BigInteger
     created_at = Column(DateTime, default=datetime.utcnow)
     
     files = relationship("File", back_populates="owner")
@@ -67,7 +67,7 @@ class File(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, index=True)
     original_filename = Column(String)
-    file_size = Column(Integer)
+    file_size = Column(BigInteger)  # FIX: Changed to BigInteger
     mime_type = Column(String)
     b2_filename = Column(String, unique=True)  # Path in Backblaze
     folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
@@ -93,8 +93,15 @@ class Folder(Base):
     files = relationship("File", back_populates="folder")
     subfolders = relationship("Folder", backref="parent", remote_side=[id])
 
-# Create tables
+# Create tables - DROP EXISTING TABLES FIRST
+try:
+    Base.metadata.drop_all(bind=engine)
+    logger.info("Dropped existing tables")
+except Exception as e:
+    logger.warning(f"Could not drop tables: {e}")
+
 Base.metadata.create_all(bind=engine)
+logger.info("Created new tables with BigInteger columns")
 
 # Pydantic Models
 class UserBase(BaseModel):
@@ -175,8 +182,7 @@ SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
-# FIX: Use argon2 instead of bcrypt to avoid the 72-byte limit issue
-# Argon2 is more secure and doesn't have the password length limitation
+# Use argon2 for password hashing
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
@@ -200,8 +206,6 @@ def get_db():
 
 def get_password_hash(password: str) -> str:
     """Hash a password for storing."""
-    # FIX: Directly hash the password without pre-hashing
-    # Argon2 can handle long passwords without issues
     return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -343,7 +347,6 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
-    # FIX: Direct hashing without pre-hashing to avoid bcrypt 72-byte limit
     hashed_password = get_password_hash(user.password)
     db_user = User(
         email=user.email, 
