@@ -14,3 +14,4 @@ boto3
 botocore
 
 python-multipart
+argon2-cffi
