@@ -18,6 +18,7 @@ import os
 import mimetypes
 import io
 import logging
+import hashlib
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -195,11 +196,18 @@ def get_db():
     finally:
         db.close()
 
-def verify_password(plain_password, hashed_password):
-    return pwd_context.verify(plain_password, hashed_password)
+def _prehash_password(password: str) -> str:
+    # Convert to bytes and hash with SHA-256
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
 
-def get_password_hash(password):
-    return pwd_context.hash(password)
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(_prehash_password(password))
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(
+        _prehash_password(plain_password),
+        hashed_password
+    )
 
 def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
