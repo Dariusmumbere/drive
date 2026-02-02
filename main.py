@@ -2,7 +2,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, LargeBinary
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr
@@ -16,7 +16,7 @@ import boto3
 from botocore.exceptions import ClientError
 import os
 import mimetypes
-from typing import Dict, Any
+import io
 import logging
 
 # Set up logging
@@ -111,7 +111,7 @@ class UserResponse(UserBase):
     created_at: datetime
     
     class Config:
-        orm_mode = True
+        from_attributes = True  # Changed from orm_mode
 
 class Token(BaseModel):
     access_token: str
@@ -142,7 +142,7 @@ class FileResponse(FileBase):
     preview_url: Optional[str] = None
     
     class Config:
-        orm_mode = True
+        from_attributes = True  # Changed from orm_mode
 
 class FolderBase(BaseModel):
     name: str
@@ -160,7 +160,7 @@ class FolderResponse(FolderBase):
     folder_count: int = 0
     
     class Config:
-        orm_mode = True
+        from_attributes = True  # Changed from orm_mode
 
 class StorageInfo(BaseModel):
     used: int
@@ -247,7 +247,7 @@ async def upload_to_b2(file: UploadFile, user_id: int) -> str:
     """Upload a file to Backblaze B2 and return the B2 filename"""
     try:
         # Generate unique filename with user folder
-        file_extension = Path(file.filename).suffix
+        file_extension = Path(file.filename).suffix if file.filename else ''
         unique_filename = f"{uuid.uuid4()}{file_extension}"
         b2_filename = f"users/{user_id}/{unique_filename}"
         
@@ -362,7 +362,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 # File Management Endpoints
 @app.post("/files/upload", response_model=FileResponse)
 async def upload_file(
-    file: UploadFile = File(...),
+    file: UploadFile = File(),  # FIXED: Removed the ... inside File()
     folder_id: Optional[int] = None,
     is_public: bool = False,
     current_user: User = Depends(get_current_user),
@@ -389,10 +389,10 @@ async def upload_file(
     
     # Create file record in database
     db_file = File(
-        filename=Path(file.filename).stem,
-        original_filename=file.filename,
+        filename=Path(file.filename).stem if file.filename else f"file_{uuid.uuid4().hex[:8]}",
+        original_filename=file.filename or "unnamed_file",
         file_size=file_size,
-        mime_type=file.content_type or mimetypes.guess_type(file.filename)[0] or "application/octet-stream",
+        mime_type=file.content_type or mimetypes.guess_type(file.filename or "")[0] or "application/octet-stream",
         b2_filename=b2_filename,
         folder_id=folder_id,
         owner_id=current_user.id,
@@ -410,11 +410,29 @@ async def upload_file(
     # Generate download URL
     download_url = await generate_presigned_url(b2_filename)
     
-    # Create response
-    response_data = FileResponse.from_orm(db_file)
-    response_data.download_url = download_url
+    # Create response using dict instead of from_orm for better compatibility
+    response_data = {
+        "id": db_file.id,
+        "filename": db_file.filename,
+        "original_filename": db_file.original_filename,
+        "file_size": db_file.file_size,
+        "mime_type": db_file.mime_type,
+        "b2_filename": db_file.b2_filename,
+        "folder_id": db_file.folder_id,
+        "owner_id": db_file.owner_id,
+        "is_public": db_file.is_public,
+        "created_at": db_file.created_at,
+        "updated_at": db_file.updated_at,
+        "download_url": download_url
+    }
     
-    return response_data
+    # Add preview URL for images and PDFs
+    if db_file.mime_type and db_file.mime_type.startswith(('image/', 'application/pdf')):
+        response_data["preview_url"] = download_url
+    else:
+        response_data["preview_url"] = None
+    
+    return FileResponse(**response_data)
 
 @app.get("/files/{file_id}", response_model=FileResponse)
 async def get_file(
@@ -435,14 +453,28 @@ async def get_file(
     download_url = await generate_presigned_url(db_file.b2_filename)
     
     # Create response
-    response_data = FileResponse.from_orm(db_file)
-    response_data.download_url = download_url
+    response_data = {
+        "id": db_file.id,
+        "filename": db_file.filename,
+        "original_filename": db_file.original_filename,
+        "file_size": db_file.file_size,
+        "mime_type": db_file.mime_type,
+        "b2_filename": db_file.b2_filename,
+        "folder_id": db_file.folder_id,
+        "owner_id": db_file.owner_id,
+        "is_public": db_file.is_public,
+        "created_at": db_file.created_at,
+        "updated_at": db_file.updated_at,
+        "download_url": download_url
+    }
     
-    # Generate preview URL for images and PDFs
-    if db_file.mime_type.startswith(('image/', 'application/pdf')):
-        response_data.preview_url = download_url
+    # Add preview URL for images and PDFs
+    if db_file.mime_type and db_file.mime_type.startswith(('image/', 'application/pdf')):
+        response_data["preview_url"] = download_url
+    else:
+        response_data["preview_url"] = None
     
-    return response_data
+    return FileResponse(**response_data)
 
 @app.get("/files/{file_id}/download")
 async def download_file(
@@ -462,7 +494,7 @@ async def download_file(
     # Generate presigned URL for direct download
     download_url = await generate_presigned_url(db_file.b2_filename)
     
-    return {"download_url": download_url}
+    return {"download_url": download_url, "filename": db_file.original_filename}
 
 @app.delete("/files/{file_id}")
 async def delete_file(
@@ -509,13 +541,32 @@ async def list_files(
     
     files = query.offset(skip).limit(limit).all()
     
-    # Generate download URLs for each file
+    # Generate response
     response_files = []
     for file in files:
         download_url = await generate_presigned_url(file.b2_filename)
-        response_data = FileResponse.from_orm(file)
-        response_data.download_url = download_url
-        response_files.append(response_data)
+        
+        response_data = {
+            "id": file.id,
+            "filename": file.filename,
+            "original_filename": file.original_filename,
+            "file_size": file.file_size,
+            "mime_type": file.mime_type,
+            "b2_filename": file.b2_filename,
+            "folder_id": file.folder_id,
+            "owner_id": file.owner_id,
+            "is_public": file.is_public,
+            "created_at": file.created_at,
+            "updated_at": file.updated_at,
+            "download_url": download_url
+        }
+        
+        if file.mime_type and file.mime_type.startswith(('image/', 'application/pdf')):
+            response_data["preview_url"] = download_url
+        else:
+            response_data["preview_url"] = None
+        
+        response_files.append(FileResponse(**response_data))
     
     return response_files
 
@@ -567,11 +618,18 @@ async def create_folder(
         Folder.owner_id == current_user.id
     ).count()
     
-    response_data = FolderResponse.from_orm(db_folder)
-    response_data.file_count = file_count
-    response_data.folder_count = folder_count
+    response_data = {
+        "id": db_folder.id,
+        "name": db_folder.name,
+        "parent_id": db_folder.parent_id,
+        "owner_id": db_folder.owner_id,
+        "created_at": db_folder.created_at,
+        "updated_at": db_folder.updated_at,
+        "file_count": file_count,
+        "folder_count": folder_count
+    }
     
-    return response_data
+    return FolderResponse(**response_data)
 
 @app.get("/folders/{folder_id}", response_model=FolderResponse)
 async def get_folder(
@@ -599,11 +657,18 @@ async def get_folder(
         Folder.owner_id == current_user.id
     ).count()
     
-    response_data = FolderResponse.from_orm(db_folder)
-    response_data.file_count = file_count
-    response_data.folder_count = folder_count
+    response_data = {
+        "id": db_folder.id,
+        "name": db_folder.name,
+        "parent_id": db_folder.parent_id,
+        "owner_id": db_folder.owner_id,
+        "created_at": db_folder.created_at,
+        "updated_at": db_folder.updated_at,
+        "file_count": file_count,
+        "folder_count": folder_count
+    }
     
-    return response_data
+    return FolderResponse(**response_data)
 
 @app.get("/folders", response_model=List[FolderResponse])
 async def list_folders(
@@ -636,10 +701,18 @@ async def list_folders(
             Folder.owner_id == current_user.id
         ).count()
         
-        response_data = FolderResponse.from_orm(folder)
-        response_data.file_count = file_count
-        response_data.folder_count = folder_count
-        response_folders.append(response_data)
+        response_data = {
+            "id": folder.id,
+            "name": folder.name,
+            "parent_id": folder.parent_id,
+            "owner_id": folder.owner_id,
+            "created_at": folder.created_at,
+            "updated_at": folder.updated_at,
+            "file_count": file_count,
+            "folder_count": folder_count
+        }
+        
+        response_folders.append(FolderResponse(**response_data))
     
     return response_folders
 
@@ -684,11 +757,15 @@ async def delete_folder(
     # Delete all files from Backblaze B2 and update storage
     total_deleted_size = 0
     for file in all_files:
-        await delete_from_b2(file.b2_filename)
-        total_deleted_size += file.file_size
+        try:
+            await delete_from_b2(file.b2_filename)
+            total_deleted_size += file.file_size
+        except Exception as e:
+            logger.error(f"Error deleting file {file.id} from B2: {e}")
     
     # Update user storage usage
-    update_storage_used(db, current_user, total_deleted_size, "subtract")
+    if total_deleted_size > 0:
+        update_storage_used(db, current_user, total_deleted_size, "subtract")
     
     # Delete all files and folders from database
     # (In production, you might want to use cascade delete or recursive CTE)
@@ -750,9 +827,28 @@ async def search_files(
     response_files = []
     for file in files:
         download_url = await generate_presigned_url(file.b2_filename)
-        response_data = FileResponse.from_orm(file)
-        response_data.download_url = download_url
-        response_files.append(response_data)
+        
+        response_data = {
+            "id": file.id,
+            "filename": file.filename,
+            "original_filename": file.original_filename,
+            "file_size": file.file_size,
+            "mime_type": file.mime_type,
+            "b2_filename": file.b2_filename,
+            "folder_id": file.folder_id,
+            "owner_id": file.owner_id,
+            "is_public": file.is_public,
+            "created_at": file.created_at,
+            "updated_at": file.updated_at,
+            "download_url": download_url
+        }
+        
+        if file.mime_type and file.mime_type.startswith(('image/', 'application/pdf')):
+            response_data["preview_url"] = download_url
+        else:
+            response_data["preview_url"] = None
+        
+        response_files.append(FileResponse(**response_data))
     
     return response_files
 
@@ -774,10 +870,27 @@ async def get_public_file(
     # Generate download URL
     download_url = await generate_presigned_url(db_file.b2_filename)
     
-    response_data = FileResponse.from_orm(db_file)
-    response_data.download_url = download_url
+    response_data = {
+        "id": db_file.id,
+        "filename": db_file.filename,
+        "original_filename": db_file.original_filename,
+        "file_size": db_file.file_size,
+        "mime_type": db_file.mime_type,
+        "b2_filename": db_file.b2_filename,
+        "folder_id": db_file.folder_id,
+        "owner_id": db_file.owner_id,
+        "is_public": db_file.is_public,
+        "created_at": db_file.created_at,
+        "updated_at": db_file.updated_at,
+        "download_url": download_url
+    }
     
-    return response_data
+    if db_file.mime_type and db_file.mime_type.startswith(('image/', 'application/pdf')):
+        response_data["preview_url"] = download_url
+    else:
+        response_data["preview_url"] = None
+    
+    return FileResponse(**response_data)
 
 @app.put("/files/{file_id}/share")
 async def toggle_file_share(
@@ -807,11 +920,29 @@ def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
+# Root endpoint
+@app.get("/")
+def read_root():
+    """Root endpoint with API information"""
+    return {
+        "message": "Cloud Drive API",
+        "version": "1.0.0",
+        "documentation": "/docs",
+        "endpoints": {
+            "auth": ["POST /token", "POST /users/", "GET /users/me/"],
+            "files": ["POST /files/upload", "GET /files", "GET /files/{id}", "DELETE /files/{id}"],
+            "folders": ["POST /folders/", "GET /folders", "GET /folders/{id}", "DELETE /folders/{id}"],
+            "storage": ["GET /storage/info"],
+            "search": ["GET /search"],
+            "sharing": ["GET /public/files/{id}", "PUT /files/{id}/share"]
+        }
+    }
+
 if __name__ == "__main__":
     import uvicorn
-    import io  # Import io for BytesIO
     
     # Ensure database tables are created
     Base.metadata.create_all(bind=engine)
     
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
