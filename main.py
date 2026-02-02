@@ -1,5 +1,5 @@
 # main.py
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File, Request
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text
@@ -370,7 +370,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 # File Management Endpoints
 @app.post("/files/upload", response_model=FileResponse)
 async def upload_file(
-    file: UploadFile = File(...),
+    file: UploadFile = FastAPIFile(...),
     folder_id: Optional[int] = None,
     is_public: bool = False,
     current_user: User = Depends(get_current_user),
