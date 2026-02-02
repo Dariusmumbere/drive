@@ -1,11 +1,11 @@
 # main.py
-from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, Request
+from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, BigInteger
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, BigInteger, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime, timedelta
 from typing import Optional, List
 from jose import JWTError, jwt
@@ -54,12 +54,12 @@ class User(Base):
     hashed_password = Column(String)
     full_name = Column(String)
     is_active = Column(Boolean, default=True)
-    storage_used = Column(BigInteger, default=0)  # FIX: Changed to BigInteger
-    storage_limit = Column(BigInteger, default=10737418240)  # FIX: Changed to BigInteger
+    storage_used = Column(BigInteger, default=0)
+    storage_limit = Column(BigInteger, default=10737418240)  # 10GB in bytes
     created_at = Column(DateTime, default=datetime.utcnow)
     
-    files = relationship("File", back_populates="owner")
-    folders = relationship("Folder", back_populates="owner")
+    files = relationship("File", back_populates="owner", cascade="all, delete-orphan")
+    folders = relationship("Folder", back_populates="owner", cascade="all, delete-orphan")
 
 class File(Base):
     __tablename__ = "files"
@@ -67,11 +67,11 @@ class File(Base):
     id = Column(Integer, primary_key=True, index=True)
     filename = Column(String, index=True)
     original_filename = Column(String)
-    file_size = Column(BigInteger)  # FIX: Changed to BigInteger
+    file_size = Column(BigInteger)
     mime_type = Column(String)
     b2_filename = Column(String, unique=True)  # Path in Backblaze
-    folder_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
-    owner_id = Column(Integer, ForeignKey("users.id"))
+    folder_id = Column(Integer, ForeignKey("folders.id", ondelete="CASCADE"), nullable=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
     is_public = Column(Boolean, default=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -84,16 +84,16 @@ class Folder(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, index=True)
-    parent_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
-    owner_id = Column(Integer, ForeignKey("users.id"))
+    parent_id = Column(Integer, ForeignKey("folders.id", ondelete="CASCADE"), nullable=True)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     owner = relationship("User", back_populates="folders")
-    files = relationship("File", back_populates="folder")
-    subfolders = relationship("Folder", backref="parent", remote_side=[id])
+    files = relationship("File", back_populates="folder", cascade="all, delete-orphan")
+    subfolders = relationship("Folder", backref="parent", remote_side=[id], cascade="all, delete-orphan")
 
-# Create tables - DROP EXISTING TABLES FIRST
+# Create tables
 try:
     Base.metadata.drop_all(bind=engine)
     logger.info("Dropped existing tables")
@@ -110,6 +110,12 @@ class UserBase(BaseModel):
 
 class UserCreate(UserBase):
     password: str
+    
+    @validator('password')
+    def password_length(cls, v):
+        if len(v) < 6:
+            raise ValueError('Password must be at least 6 characters long')
+        return v
 
 class UserResponse(UserBase):
     id: int
@@ -177,6 +183,9 @@ class StorageInfo(BaseModel):
     files_count: int
     folders_count: int
 
+class ShareRequest(BaseModel):
+    is_public: bool
+
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
@@ -188,12 +197,14 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="Cloud Drive API")
 
+# Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure properly for production
+    allow_origins=["*"],  # In production, specify your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"]
 )
 
 # Dependency
@@ -251,6 +262,8 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     user = get_user_by_email(db, email=token_data.email)
     if user is None:
         raise credentials_exception
+    if not user.is_active:
+        raise HTTPException(status_code=400, detail="Inactive user")
     return user
 
 # B2 Helper Functions
@@ -287,7 +300,6 @@ async def delete_from_b2(b2_filename: str):
         logger.info(f"File deleted from B2: {b2_filename}")
     except Exception as e:
         logger.error(f"Error deleting file from B2: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Error deleting file: {str(e)}")
 
 async def generate_presigned_url(b2_filename: str, expiration: int = 3600):
     """Generate a presigned URL for private B2 objects"""
@@ -317,9 +329,7 @@ def update_storage_used(db: Session, user: User, file_size: int, operation: str 
     if operation == "add":
         user.storage_used += file_size
     elif operation == "subtract":
-        user.storage_used -= file_size
-        if user.storage_used < 0:
-            user.storage_used = 0
+        user.storage_used = max(0, user.storage_used - file_size)
     db.commit()
 
 # Auth Endpoints
@@ -354,14 +364,6 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
         full_name=user.full_name
     )
     db.add(db_user)
-    
-    # Create root folder for user
-    root_folder = Folder(
-        name="Root",
-        owner_id=db_user.id
-    )
-    db.add(root_folder)
-    
     db.commit()
     db.refresh(db_user)
     return db_user
@@ -374,15 +376,14 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 @app.post("/files/upload", response_model=FileResponse)
 async def upload_file(
     file: UploadFile = FastAPIFile(...),
-    folder_id: Optional[int] = None,
-    is_public: bool = False,
+    folder_id: Optional[int] = Query(None),
+    is_public: bool = Query(False),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """Upload a file to cloud storage"""
     
     # Check storage limit
-    file_size = 0
     file_content = await file.read()
     file_size = len(file_content)
     
@@ -493,7 +494,7 @@ async def download_file(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """Download a file"""
+    """Get download URL for a file"""
     db_file = db.query(File).filter(
         File.id == file_id,
         File.owner_id == current_user.id
@@ -536,7 +537,7 @@ async def delete_file(
 
 @app.get("/files", response_model=List[FileResponse])
 async def list_files(
-    folder_id: Optional[int] = None,
+    folder_id: Optional[int] = Query(None),
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_user),
@@ -550,7 +551,7 @@ async def list_files(
     else:
         query = query.filter(File.folder_id.is_(None))
     
-    files = query.offset(skip).limit(limit).all()
+    files = query.order_by(File.created_at.desc()).offset(skip).limit(limit).all()
     
     # Generate response
     response_files = []
@@ -683,7 +684,7 @@ async def get_folder(
 
 @app.get("/folders", response_model=List[FolderResponse])
 async def list_folders(
-    parent_id: Optional[int] = None,
+    parent_id: Optional[int] = Query(None),
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_user),
@@ -697,7 +698,7 @@ async def list_folders(
     else:
         query = query.filter(Folder.parent_id.is_(None))
     
-    folders = query.offset(skip).limit(limit).all()
+    folders = query.order_by(Folder.created_at.desc()).offset(skip).limit(limit).all()
     
     # Get counts for each folder
     response_folders = []
@@ -822,7 +823,7 @@ async def get_storage_info(
     )
 
 # Search Endpoints
-@app.get("/search")
+@app.get("/search", response_model=List[FileResponse])
 async def search_files(
     query: str,
     current_user: User = Depends(get_current_user),
@@ -832,7 +833,7 @@ async def search_files(
     files = db.query(File).filter(
         File.owner_id == current_user.id,
         (File.filename.ilike(f"%{query}%")) | (File.original_filename.ilike(f"%{query}%"))
-    ).limit(50).all()
+    ).order_by(File.created_at.desc()).limit(50).all()
     
     response_files = []
     for file in files:
@@ -863,7 +864,7 @@ async def search_files(
     return response_files
 
 # Public File Access (for shared files)
-@app.get("/public/files/{file_id}")
+@app.get("/public/files/{file_id}", response_model=FileResponse)
 async def get_public_file(
     file_id: int,
     db: Session = Depends(get_db)
@@ -905,7 +906,7 @@ async def get_public_file(
 @app.put("/files/{file_id}/share")
 async def toggle_file_share(
     file_id: int,
-    is_public: bool,
+    share_request: ShareRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -918,11 +919,11 @@ async def toggle_file_share(
     if not db_file:
         raise HTTPException(status_code=404, detail="File not found")
     
-    db_file.is_public = is_public
+    db_file.is_public = share_request.is_public
     db.commit()
     db.refresh(db_file)
     
-    return {"message": f"File is now {'public' if is_public else 'private'}", "is_public": is_public}
+    return {"message": f"File is now {'public' if share_request.is_public else 'private'}", "is_public": share_request.is_public}
 
 # Health check
 @app.get("/health")
@@ -950,9 +951,6 @@ def read_root():
 
 if __name__ == "__main__":
     import uvicorn
-    
-    # Ensure database tables are created
-    Base.metadata.create_all(bind=engine)
     
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
