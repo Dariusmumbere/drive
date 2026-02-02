@@ -112,7 +112,7 @@ class UserResponse(UserBase):
     created_at: datetime
     
     class Config:
-        from_attributes = True  # Changed from orm_mode
+        from_attributes = True
 
 class Token(BaseModel):
     access_token: str
@@ -143,7 +143,7 @@ class FileResponse(FileBase):
     preview_url: Optional[str] = None
     
     class Config:
-        from_attributes = True  # Changed from orm_mode
+        from_attributes = True
 
 class FolderBase(BaseModel):
     name: str
@@ -161,7 +161,7 @@ class FolderResponse(FolderBase):
     folder_count: int = 0
     
     class Config:
-        from_attributes = True  # Changed from orm_mode
+        from_attributes = True
 
 class StorageInfo(BaseModel):
     used: int
@@ -175,7 +175,9 @@ SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production"
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 1440  # 24 hours
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+# FIX: Use argon2 instead of bcrypt to avoid the 72-byte limit issue
+# Argon2 is more secure and doesn't have the password length limitation
+pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="Cloud Drive API")
@@ -196,18 +198,15 @@ def get_db():
     finally:
         db.close()
 
-def _prehash_password(password: str) -> str:
-    # Convert to bytes and hash with SHA-256
-    return hashlib.sha256(password.encode("utf-8")).hexdigest()
-
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(_prehash_password(password))
+    """Hash a password for storing."""
+    # FIX: Directly hash the password without pre-hashing
+    # Argon2 can handle long passwords without issues
+    return pwd_context.hash(password)
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(
-        _prehash_password(plain_password),
-        hashed_password
-    )
+    """Verify a stored password against one provided by user."""
+    return pwd_context.verify(plain_password, hashed_password)
 
 def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
@@ -344,6 +343,7 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     if db_user:
         raise HTTPException(status_code=400, detail="Email already registered")
     
+    # FIX: Direct hashing without pre-hashing to avoid bcrypt 72-byte limit
     hashed_password = get_password_hash(user.password)
     db_user = User(
         email=user.email, 
@@ -370,7 +370,7 @@ async def read_users_me(current_user: User = Depends(get_current_user)):
 # File Management Endpoints
 @app.post("/files/upload", response_model=FileResponse)
 async def upload_file(
-    file: UploadFile = File(),  # FIXED: Removed the ... inside File()
+    file: UploadFile = File(...),
     folder_id: Optional[int] = None,
     is_public: bool = False,
     current_user: User = Depends(get_current_user),
@@ -418,7 +418,7 @@ async def upload_file(
     # Generate download URL
     download_url = await generate_presigned_url(b2_filename)
     
-    # Create response using dict instead of from_orm for better compatibility
+    # Create response
     response_data = {
         "id": db_file.id,
         "filename": db_file.filename,
@@ -776,7 +776,6 @@ async def delete_folder(
         update_storage_used(db, current_user, total_deleted_size, "subtract")
     
     # Delete all files and folders from database
-    # (In production, you might want to use cascade delete or recursive CTE)
     for file in all_files:
         db.delete(file)
     
