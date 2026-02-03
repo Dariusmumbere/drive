@@ -555,7 +555,7 @@ async def delete_file(
 
 @app.get("/files", response_model=List[FileResponse])
 async def list_files(
-    folder_id: Optional[int] = Query(None),
+    folder_id: Optional[Union[int, str]] = Query(None),
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_user),
@@ -564,8 +564,16 @@ async def list_files(
     """List files in a folder or root"""
     query = db.query(File).filter(File.owner_id == current_user.id)
     
+    # Handle folder_id parameter (can be "null" string or integer)
     if folder_id is not None:
-        query = query.filter(File.folder_id == folder_id)
+        if isinstance(folder_id, str) and folder_id.lower() == "null":
+            query = query.filter(File.folder_id.is_(None))
+        else:
+            try:
+                folder_id_int = int(folder_id)
+                query = query.filter(File.folder_id == folder_id_int)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid folder_id parameter")
     else:
         query = query.filter(File.folder_id.is_(None))
     
