@@ -84,6 +84,9 @@ class Folder(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))  # Added this line
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     parent_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
 
@@ -101,6 +104,12 @@ class Folder(Base):
         back_populates="subfolders",
         remote_side=[id]
     )
+    
+    # Relationship to owner
+    owner = relationship("User", back_populates="folders")
+    
+    # Relationship to files
+    files = relationship("File", back_populates="folder", cascade="all, delete-orphan")
 
 # Create tables
 try:
@@ -832,8 +841,8 @@ async def get_storage_info(
     percentage = (current_user.storage_used / current_user.storage_limit * 100) if current_user.storage_limit > 0 else 0
     
     return StorageInfo(
-        used=currentUser.storage_used,
-        limit=currentUser.storage_limit,
+        used=current_user.storage_used,
+        limit=current_user.storage_limit,
         percentage=round(percentage, 2),
         files_count=files_count,
         folders_count=folders_count
