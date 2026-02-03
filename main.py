@@ -27,8 +27,8 @@ logger = logging.getLogger(__name__)
 # Backblaze B2 Configuration
 B2_BUCKET_NAME = os.getenv("B2_BUCKET_NAME", "uploads-dir")
 B2_ENDPOINT_URL = os.getenv("B2_ENDPOINT_URL", "https://s3.us-east-005.backblazeb2.com")
-B2_KEY_ID = os.getenv("B2_KEY_ID", "0055ca7845641d30000000002")
-B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY", "K005NNeGM9r28ujQ3jvNEQy2zUiu0TI")
+B2_KEY_ID = os.getenv("B2_KEY_ID", "0055ca7845641d30000000003")
+B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY", "K005biwK475Ji5j7PGdbvOqcnNQDx4I")
 
 # Initialize B2 client
 b2_client = boto3.client(
