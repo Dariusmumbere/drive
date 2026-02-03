@@ -7,7 +7,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
 from pydantic import BaseModel, EmailStr, validator
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Union
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import uuid
@@ -684,7 +684,7 @@ async def get_folder(
 
 @app.get("/folders", response_model=List[FolderResponse])
 async def list_folders(
-    parent_id: Optional[int] = Query(None),
+    parent_id: Optional[Union[int, str]] = Query(None),
     skip: int = 0,
     limit: int = 100,
     current_user: User = Depends(get_current_user),
@@ -693,8 +693,16 @@ async def list_folders(
     """List folders"""
     query = db.query(Folder).filter(Folder.owner_id == current_user.id)
     
+    # Handle parent_id parameter (can be "null" string or integer)
     if parent_id is not None:
-        query = query.filter(Folder.parent_id == parent_id)
+        if isinstance(parent_id, str) and parent_id.lower() == "null":
+            query = query.filter(Folder.parent_id.is_(None))
+        else:
+            try:
+                parent_id_int = int(parent_id)
+                query = query.filter(Folder.parent_id == parent_id_int)
+            except ValueError:
+                raise HTTPException(status_code=422, detail="Invalid parent_id parameter")
     else:
         query = query.filter(Folder.parent_id.is_(None))
     
@@ -815,8 +823,8 @@ async def get_storage_info(
     percentage = (current_user.storage_used / current_user.storage_limit * 100) if current_user.storage_limit > 0 else 0
     
     return StorageInfo(
-        used=current_user.storage_used,
-        limit=current_user.storage_limit,
+        used=currentUser.storage_used,
+        limit=currentUser.storage_limit,
         percentage=round(percentage, 2),
         files_count=files_count,
         folders_count=folders_count
