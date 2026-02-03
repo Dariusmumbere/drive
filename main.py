@@ -81,17 +81,26 @@ class File(Base):
 
 class Folder(Base):
     __tablename__ = "folders"
-    
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, index=True)
-    parent_id = Column(Integer, ForeignKey("folders.id", ondelete="CASCADE"), nullable=True)
-    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
-    
-    owner = relationship("User", back_populates="folders")
-    files = relationship("File", back_populates="folder", cascade="all, delete-orphan")
-    subfolders = relationship("Folder", backref="parent", remote_side=[id], cascade="all, delete-orphan")
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String, nullable=False)
+
+    parent_id = Column(Integer, ForeignKey("folders.id"), nullable=True)
+
+    # ONE → MANY (parent → subfolders)
+    subfolders = relationship(
+        "Folder",
+        back_populates="parent",
+        cascade="all, delete-orphan",
+        single_parent=True
+    )
+
+    # MANY → ONE (child → parent)
+    parent = relationship(
+        "Folder",
+        back_populates="subfolders",
+        remote_side=[id]
+    )
 
 # Create tables
 try:
