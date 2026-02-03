@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 import boto3
 from botocore.exceptions import ClientError
+from botocore.config import Config
 import os
 import mimetypes
 import io
@@ -30,13 +31,18 @@ B2_ENDPOINT_URL = os.getenv("B2_ENDPOINT_URL", "https://s3.us-east-005.backblaze
 B2_KEY_ID = os.getenv("B2_KEY_ID", "0055ca7845641d30000000003")
 B2_APPLICATION_KEY = os.getenv("B2_APPLICATION_KEY", "K005biwK475Ji5j7PGdbvOqcnNQDx4I")
 
-# Initialize B2 client
 b2_client = boto3.client(
-    's3',
-    endpoint_url=B2_ENDPOINT_URL,
+    "s3",
+    endpoint_url="https://s3.us-east-005.backblazeb2.com",
     aws_access_key_id=B2_KEY_ID,
-    aws_secret_access_key=B2_APPLICATION_KEY
+    aws_secret_access_key=B2_APPLICATION_KEY,
+    region_name="us-east-005",
+    config=Config(
+        signature_version="s3v4",
+        s3={"addressing_style": "path"}
+    )
 )
+
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://drive_ckby_user:BEllpEiHkxMdRTnwCx76KJhSDABSYBuN@dpg-d60bhe4hg0os73a7u4d0-a/drive_ckby")
