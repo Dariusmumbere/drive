@@ -20,6 +20,10 @@ import mimetypes
 import io
 import logging
 import hashlib
+from authlib.integrations.starlette_client import OAuth
+from starlette.config import Config as StarletteConfig
+from starlette.requests import Request
+from starlette.responses import RedirectResponse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -43,6 +47,10 @@ b2_client = boto3.client(
     )
 )
 
+# Google OAuth Configuration
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://drive_ckby_user:BEllpEiHkxMdRTnwCx76KJhSDABSYBuN@dpg-d60bhe4hg0os73a7u4d0-a/drive_ckby")
@@ -57,12 +65,14 @@ class User(Base):
     
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
-    hashed_password = Column(String)
+    hashed_password = Column(String, nullable=True)  # Nullable for Google OAuth users
     full_name = Column(String)
     is_active = Column(Boolean, default=True)
     storage_used = Column(BigInteger, default=0)
     storage_limit = Column(BigInteger, default=10737418240)  # 10GB in bytes
     created_at = Column(DateTime, default=datetime.utcnow)
+    auth_provider = Column(String, default="email")  # 'email' or 'google'
+    google_id = Column(String, unique=True, nullable=True)  # Google user ID
     
     files = relationship("File", back_populates="owner", cascade="all, delete-orphan")
     folders = relationship("Folder", back_populates="owner", cascade="all, delete-orphan")
@@ -147,6 +157,7 @@ class UserResponse(UserBase):
     storage_used: int
     storage_limit: int
     created_at: datetime
+    auth_provider: str
     
     class Config:
         from_attributes = True
@@ -210,6 +221,11 @@ class StorageInfo(BaseModel):
 class ShareRequest(BaseModel):
     is_public: bool
 
+class GoogleUserInfo(BaseModel):
+    email: str
+    name: str
+    sub: str  # Google user ID
+
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
@@ -220,6 +236,18 @@ pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="Cloud Drive API")
+
+# Configure OAuth for Google
+starlette_config = StarletteConfig(environ={
+    'GOOGLE_CLIENT_ID': GOOGLE_CLIENT_ID,
+    'GOOGLE_CLIENT_SECRET': GOOGLE_CLIENT_SECRET
+})
+oauth = OAuth(starlette_config)
+oauth.register(
+    name='google',
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={'scope': 'openid email profile'}
+)
 
 # Configure CORS
 app.add_middleware(
@@ -250,9 +278,14 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
 
+def get_user_by_google_id(db: Session, google_id: str):
+    return db.query(User).filter(User.google_id == google_id).first()
+
 def authenticate_user(db: Session, email: str, password: str):
     user = get_user_by_email(db, email)
     if not user:
+        return False
+    if not user.hashed_password:  # User created via Google OAuth
         return False
     if not verify_password(password, user.hashed_password):
         return False
@@ -288,6 +321,45 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
         raise credentials_exception
     if not user.is_active:
         raise HTTPException(status_code=400, detail="Inactive user")
+    return user
+
+def create_or_update_user_from_google(db: Session, google_user_info: GoogleUserInfo):
+    """Create or update user from Google OAuth data"""
+    # Check if user exists by Google ID
+    user = get_user_by_google_id(db, google_user_info.sub)
+    
+    if user:
+        # Update user info if needed
+        if user.email != google_user_info.email or user.full_name != google_user_info.name:
+            user.email = google_user_info.email
+            user.full_name = google_user_info.name
+            db.commit()
+            db.refresh(user)
+        return user
+    
+    # Check if user exists by email
+    user = get_user_by_email(db, google_user_info.email)
+    
+    if user:
+        # Link Google account to existing email account
+        user.google_id = google_user_info.sub
+        user.auth_provider = "google"
+        db.commit()
+        db.refresh(user)
+        return user
+    
+    # Create new user
+    user = User(
+        email=google_user_info.email,
+        full_name=google_user_info.name,
+        google_id=google_user_info.sub,
+        auth_provider="google",
+        hashed_password=None  # No password for Google users
+    )
+    
+    db.add(user)
+    db.commit()
+    db.refresh(user)
     return user
 
 # B2 Helper Functions
@@ -375,6 +447,69 @@ async def login_for_access_token(
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
+# Google OAuth Endpoints
+@app.get("/auth/google")
+async def google_auth(request: Request):
+    """Redirect to Google OAuth page"""
+    redirect_uri = GOOGLE_REDIRECT_URI
+    return await oauth.google.authorize_redirect(request, redirect_uri)
+
+@app.get("/auth/google/callback")
+async def google_auth_callback(request: Request, db: Session = Depends(get_db)):
+    """Handle Google OAuth callback"""
+    try:
+        token = await oauth.google.authorize_access_token(request)
+        user_info = token.get('userinfo')
+        
+        if not user_info:
+            raise HTTPException(status_code=400, detail="Failed to get user info from Google")
+        
+        # Create or update user in database
+        google_user = GoogleUserInfo(
+            email=user_info.get('email'),
+            name=user_info.get('name'),
+            sub=user_info.get('sub')
+        )
+        
+        user = create_or_update_user_from_google(db, google_user)
+        
+        # Create JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email}, expires_delta=access_token_expires
+        )
+        
+        # Return HTML that will store token and redirect
+        html_content = f"""
+        <html>
+            <body>
+                <script>
+                    // Store token and user info in localStorage
+                    localStorage.setItem('cloud_drive_token', '{access_token}');
+                    localStorage.setItem('cloud_drive_user', JSON.stringify({{
+                        id: {user.id},
+                        email: '{user.email}',
+                        full_name: '{user.full_name}',
+                        is_active: {str(user.is_active).lower()},
+                        storage_used: {user.storage_used},
+                        storage_limit: {user.storage_limit},
+                        created_at: '{user.created_at}',
+                        auth_provider: '{user.auth_provider}'
+                    }}));
+                    
+                    // Redirect to frontend
+                    window.location.href = '{request.base_url.scheme}://{request.base_url.hostname}:{request.base_url.port or 80}';
+                </script>
+            </body>
+        </html>
+        """
+        
+        return HTMLResponse(content=html_content)
+        
+    except Exception as e:
+        logger.error(f"Google OAuth error: {str(e)}")
+        raise HTTPException(status_code=400, detail="Google authentication failed")
+
 @app.post("/users/", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = get_user_by_email(db, email=user.email)
@@ -385,7 +520,8 @@ def create_user(user: UserCreate, db: Session = Depends(get_db)):
     db_user = User(
         email=user.email, 
         hashed_password=hashed_password, 
-        full_name=user.full_name
+        full_name=user.full_name,
+        auth_provider="email"
     )
     db.add(db_user)
     db.commit()
@@ -980,7 +1116,7 @@ def read_root():
         "version": "1.0.0",
         "documentation": "/docs",
         "endpoints": {
-            "auth": ["POST /token", "POST /users/", "GET /users/me/"],
+            "auth": ["POST /token", "POST /users/", "GET /users/me/", "GET /auth/google", "GET /auth/google/callback"],
             "files": ["POST /files/upload", "GET /files", "GET /files/{id}", "DELETE /files/{id}"],
             "folders": ["POST /folders/", "GET /folders", "GET /folders/{id}", "DELETE /folders/{id}"],
             "storage": ["GET /storage/info"],
@@ -991,6 +1127,7 @@ def read_root():
 
 if __name__ == "__main__":
     import uvicorn
+    from fastapi.responses import HTMLResponse
     
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
