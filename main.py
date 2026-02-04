@@ -2,6 +2,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.responses import HTMLResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, BigInteger, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
@@ -20,10 +21,6 @@ import mimetypes
 import io
 import logging
 import hashlib
-from authlib.integrations.starlette_client import OAuth
-from starlette.config import Config as StarletteConfig
-from starlette.requests import Request
-from starlette.responses import RedirectResponse
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +48,10 @@ b2_client = boto3.client(
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
 GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+
+# Import Google auth libraries
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://drive_ckby_user:BEllpEiHkxMdRTnwCx76KJhSDABSYBuN@dpg-d60bhe4hg0os73a7u4d0-a/drive_ckby")
@@ -226,6 +227,9 @@ class GoogleUserInfo(BaseModel):
     name: str
     sub: str  # Google user ID
 
+class GoogleAuthRequest(BaseModel):
+    token: str
+
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
 ALGORITHM = "HS256"
@@ -236,18 +240,6 @@ pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="Cloud Drive API")
-
-# Configure OAuth for Google
-starlette_config = StarletteConfig(environ={
-    'GOOGLE_CLIENT_ID': GOOGLE_CLIENT_ID,
-    'GOOGLE_CLIENT_SECRET': GOOGLE_CLIENT_SECRET
-})
-oauth = OAuth(starlette_config)
-oauth.register(
-    name='google',
-    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
-    client_kwargs={'scope': 'openid email profile'}
-)
 
 # Configure CORS
 app.add_middleware(
@@ -447,30 +439,30 @@ async def login_for_access_token(
     )
     return {"access_token": access_token, "token_type": "bearer"}
 
-# Google OAuth Endpoints
-@app.get("/auth/google")
-async def google_auth(request: Request):
-    """Redirect to Google OAuth page"""
-    redirect_uri = GOOGLE_REDIRECT_URI
-    return await oauth.google.authorize_redirect(request, redirect_uri)
+# Google OAuth Endpoints (using google.oauth2 instead of Authlib)
+@app.post("/auth/google")
+async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
+    """Authenticate with Google token"""
+    token = payload.token
+    if not token:
+        raise HTTPException(status_code=400, detail="Token missing")
 
-@app.get("/auth/google/callback")
-async def google_auth_callback(request: Request, db: Session = Depends(get_db)):
-    """Handle Google OAuth callback"""
     try:
-        token = await oauth.google.authorize_access_token(request)
-        user_info = token.get('userinfo')
-        
-        if not user_info:
-            raise HTTPException(status_code=400, detail="Failed to get user info from Google")
-        
-        # Create or update user in database
+        # Verify the Google token
+        info = id_token.verify_oauth2_token(
+            token,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+
+        # Create Google user info
         google_user = GoogleUserInfo(
-            email=user_info.get('email'),
-            name=user_info.get('name'),
-            sub=user_info.get('sub')
+            email=info["email"],
+            name=info.get("name", ""),
+            sub=info["sub"]
         )
         
+        # Create or update user in database
         user = create_or_update_user_from_google(db, google_user)
         
         # Create JWT token
@@ -479,36 +471,105 @@ async def google_auth_callback(request: Request, db: Session = Depends(get_db)):
             data={"sub": user.email}, expires_delta=access_token_expires
         )
         
-        # Return HTML that will store token and redirect
-        html_content = f"""
-        <html>
-            <body>
-                <script>
-                    // Store token and user info in localStorage
-                    localStorage.setItem('cloud_drive_token', '{access_token}');
-                    localStorage.setItem('cloud_drive_user', JSON.stringify({{
-                        id: {user.id},
-                        email: '{user.email}',
-                        full_name: '{user.full_name}',
-                        is_active: {str(user.is_active).lower()},
-                        storage_used: {user.storage_used},
-                        storage_limit: {user.storage_limit},
-                        created_at: '{user.created_at}',
-                        auth_provider: '{user.auth_provider}'
-                    }}));
-                    
-                    // Redirect to frontend
-                    window.location.href = '{request.base_url.scheme}://{request.base_url.hostname}:{request.base_url.port or 80}';
-                </script>
-            </body>
-        </html>
-        """
-        
-        return HTMLResponse(content=html_content)
-        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "full_name": user.full_name,
+                "is_active": user.is_active,
+                "storage_used": user.storage_used,
+                "storage_limit": user.storage_limit,
+                "created_at": user.created_at,
+                "auth_provider": user.auth_provider
+            }
+        }
+
     except Exception as e:
-        logger.error(f"Google OAuth error: {str(e)}")
-        raise HTTPException(status_code=400, detail="Google authentication failed")
+        logger.error(f"Google authentication error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+
+# Alternative Google OAuth endpoint for frontend redirect (optional)
+@app.get("/auth/google/web")
+async def google_auth_web():
+    """Generate HTML page for Google Sign-In button"""
+    html_content = """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Google Sign-In</title>
+        <script src="https://accounts.google.com/gsi/client" async defer></script>
+        <style>
+            body {
+                font-family: Arial, sans-serif;
+                display: flex;
+                justify-content: center;
+                align-items: center;
+                height: 100vh;
+                margin: 0;
+            }
+            .container {
+                text-align: center;
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>Sign in with Google</h2>
+            <div id="g_id_onload"
+                data-client_id="%s"
+                data-context="signin"
+                data-ux_mode="popup"
+                data-callback="handleCredentialResponse"
+                data-auto_prompt="false">
+            </div>
+            <div class="g_id_signin"
+                data-type="standard"
+                data-shape="rectangular"
+                data-theme="outline"
+                data-text="signin_with"
+                data-size="large"
+                data-logo_alignment="left">
+            </div>
+            <div id="result"></div>
+        </div>
+        
+        <script>
+            function handleCredentialResponse(response) {
+                const resultDiv = document.getElementById('result');
+                resultDiv.innerHTML = '<p>Authenticating...</p>';
+                
+                // Send the credential to your backend
+                fetch('/auth/google', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ token: response.credential })
+                })
+                .then(response => response.json())
+                .then(data => {
+                    // Store the token and user info in localStorage
+                    localStorage.setItem('cloud_drive_token', data.access_token);
+                    localStorage.setItem('cloud_drive_user', JSON.stringify(data.user));
+                    resultDiv.innerHTML = '<p style="color: green;">Authentication successful! Redirecting...</p>';
+                    
+                    // Redirect to your application
+                    setTimeout(() => {
+                        window.location.href = '/';
+                    }, 1000);
+                })
+                .catch(error => {
+                    console.error('Error:', error);
+                    resultDiv.innerHTML = '<p style="color: red;">Authentication failed. Please try again.</p>';
+                });
+            }
+        </script>
+    </body>
+    </html>
+    """ % GOOGLE_CLIENT_ID
+    return HTMLResponse(content=html_content)
 
 @app.post("/users/", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -1116,7 +1177,7 @@ def read_root():
         "version": "1.0.0",
         "documentation": "/docs",
         "endpoints": {
-            "auth": ["POST /token", "POST /users/", "GET /users/me/", "GET /auth/google", "GET /auth/google/callback"],
+            "auth": ["POST /token", "POST /users/", "GET /users/me/", "POST /auth/google", "GET /auth/google/web"],
             "files": ["POST /files/upload", "GET /files", "GET /files/{id}", "DELETE /files/{id}"],
             "folders": ["POST /folders/", "GET /folders", "GET /folders/{id}", "DELETE /folders/{id}"],
             "storage": ["GET /storage/info"],
@@ -1127,7 +1188,6 @@ def read_root():
 
 if __name__ == "__main__":
     import uvicorn
-    from fastapi.responses import HTMLResponse
     
     port = int(os.getenv("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
