@@ -490,9 +490,9 @@ async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db))
         logger.error(f"Google authentication error: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid Google token")
 
-# Alternative Google OAuth endpoint for frontend redirect (optional)
-@app.get("/auth/google/web")
-async def google_auth_web():
+# Google OAuth HTML page for testing
+@app.get("/auth/google")
+async def google_auth_page():
     """Generate HTML page for Google Sign-In button"""
     html_content = """
     <!DOCTYPE html>
@@ -508,15 +508,37 @@ async def google_auth_web():
                 align-items: center;
                 height: 100vh;
                 margin: 0;
+                background-color: #f5f5f5;
             }
             .container {
                 text-align: center;
+                background-color: white;
+                padding: 40px;
+                border-radius: 10px;
+                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            }
+            #result {
+                margin-top: 20px;
+                padding: 10px;
+                border-radius: 5px;
+            }
+            .success {
+                background-color: #d4edda;
+                color: #155724;
+                border: 1px solid #c3e6cb;
+            }
+            .error {
+                background-color: #f8d7da;
+                color: #721c24;
+                border: 1px solid #f5c6cb;
             }
         </style>
     </head>
     <body>
         <div class="container">
             <h2>Sign in with Google</h2>
+            <p>This is a test page for Google Sign-In. After authentication, you will be redirected.</p>
+            
             <div id="g_id_onload"
                 data-client_id="%s"
                 data-context="signin"
@@ -524,6 +546,7 @@ async def google_auth_web():
                 data-callback="handleCredentialResponse"
                 data-auto_prompt="false">
             </div>
+            
             <div class="g_id_signin"
                 data-type="standard"
                 data-shape="rectangular"
@@ -532,6 +555,7 @@ async def google_auth_web():
                 data-size="large"
                 data-logo_alignment="left">
             </div>
+            
             <div id="result"></div>
         </div>
         
@@ -548,21 +572,28 @@ async def google_auth_web():
                     },
                     body: JSON.stringify({ token: response.credential })
                 })
-                .then(response => response.json())
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error('Authentication failed');
+                    }
+                    return response.json();
+                })
                 .then(data => {
                     // Store the token and user info in localStorage
                     localStorage.setItem('cloud_drive_token', data.access_token);
                     localStorage.setItem('cloud_drive_user', JSON.stringify(data.user));
-                    resultDiv.innerHTML = '<p style="color: green;">Authentication successful! Redirecting...</p>';
+                    
+                    resultDiv.innerHTML = '<p class="success">✅ Authentication successful! Redirecting...</p>';
                     
                     // Redirect to your application
                     setTimeout(() => {
+                        // In a real app, redirect to your frontend
                         window.location.href = '/';
-                    }, 1000);
+                    }, 2000);
                 })
                 .catch(error => {
                     console.error('Error:', error);
-                    resultDiv.innerHTML = '<p style="color: red;">Authentication failed. Please try again.</p>';
+                    resultDiv.innerHTML = '<p class="error">❌ Authentication failed. Please try again.</p>';
                 });
             }
         </script>
@@ -570,6 +601,37 @@ async def google_auth_web():
     </html>
     """ % GOOGLE_CLIENT_ID
     return HTMLResponse(content=html_content)
+
+# Alternative endpoint for frontend redirect (optional - for callback URL)
+@app.get("/auth/google/callback")
+async def google_auth_callback(
+    code: Optional[str] = None,
+    error: Optional[str] = None,
+    state: Optional[str] = None
+):
+    """Handle Google OAuth callback (for server-side flow)"""
+    if error:
+        return HTMLResponse(content=f"""
+        <html>
+            <body>
+                <h2>Authentication Error</h2>
+                <p>Error: {error}</p>
+                <a href="/auth/google">Try again</a>
+            </body>
+        </html>
+        """)
+    
+    return HTMLResponse(content=f"""
+    <html>
+        <body>
+            <h2>Google OAuth Callback</h2>
+            <p>This endpoint is for server-side OAuth flow.</p>
+            <p>For client-side flow with Google Sign-In button, use the main <a href="/auth/google">Google Sign-In page</a>.</p>
+            <p>Code: {code}</p>
+            <p>State: {state}</p>
+        </body>
+    </html>
+    """)
 
 @app.post("/users/", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -1177,7 +1239,14 @@ def read_root():
         "version": "1.0.0",
         "documentation": "/docs",
         "endpoints": {
-            "auth": ["POST /token", "POST /users/", "GET /users/me/", "POST /auth/google", "GET /auth/google/web"],
+            "auth": [
+                "POST /token", 
+                "POST /users/", 
+                "GET /users/me/", 
+                "GET /auth/google (HTML page)", 
+                "POST /auth/google (API endpoint)",
+                "GET /auth/google/callback"
+            ],
             "files": ["POST /files/upload", "GET /files", "GET /files/{id}", "DELETE /files/{id}"],
             "folders": ["POST /folders/", "GET /folders", "GET /folders/{id}", "DELETE /folders/{id}"],
             "storage": ["GET /storage/info"],
