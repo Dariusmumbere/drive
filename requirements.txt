@@ -15,5 +15,4 @@ botocore
 
 python-multipart
 argon2-cffi
-authlib
-httpx
+google-auth
