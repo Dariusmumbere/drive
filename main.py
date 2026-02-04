@@ -442,7 +442,7 @@ async def login_for_access_token(
 # Google OAuth Endpoints (using google.oauth2 instead of Authlib)
 @app.post("/auth/google")
 async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
-    """Authenticate with Google token"""
+    """Authenticate with Google token and redirect to frontend"""
     token = payload.token
     if not token:
         raise HTTPException(status_code=400, detail="Token missing")
@@ -471,25 +471,17 @@ async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db))
             data={"sub": user.email}, expires_delta=access_token_expires
         )
         
-        return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "full_name": user.full_name,
-                "is_active": user.is_active,
-                "storage_used": user.storage_used,
-                "storage_limit": user.storage_limit,
-                "created_at": user.created_at,
-                "auth_provider": user.auth_provider
-            }
-        }
+        # Instead of returning JSON, redirect to frontend with token in URL fragment
+        frontend_url = "https://dariusmumbere.github.io/cloud"
+        # You can pass the token as a query parameter or in the fragment
+        redirect_url = f"{frontend_url}#token={access_token}"
+        
+        return RedirectResponse(url=redirect_url)
 
     except Exception as e:
         logger.error(f"Google authentication error: {str(e)}")
         raise HTTPException(status_code=401, detail="Invalid Google token")
-
+        
 # Google OAuth HTML page for testing
 @app.get("/auth/google")
 async def google_auth_page():
