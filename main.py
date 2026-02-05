@@ -242,13 +242,21 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 app = FastAPI(title="Cloud Drive API")
 
 # Configure CORS
+# Update the CORS middleware configuration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://dariusmumbere.github.io"],  # In production, specify your frontend URL
+    allow_origins=[
+        "https://dariusmumbere.github.io",
+        "http://localhost:5500",  # For local development
+        "http://127.0.0.1:5500",  # For local development
+        "http://localhost:3000",  # React/Vue dev server
+        "http://localhost:8000",  # Local backend
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["*"]
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    expose_headers=["*"],
+    max_age=600,  # Cache preflight requests for 10 minutes
 )
 
 # Dependency
