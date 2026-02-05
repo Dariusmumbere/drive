@@ -2,7 +2,7 @@
 from fastapi import FastAPI, Depends, HTTPException, status, UploadFile, File as FastAPIFile, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, Text, BigInteger, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, relationship, Session
@@ -21,6 +21,7 @@ import mimetypes
 import io
 import logging
 import hashlib
+import json
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -45,9 +46,9 @@ b2_client = boto3.client(
 )
 
 # Google OAuth Configuration
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "304984836974-0o5rdilg1pdvg3almd5js4b42je8p6e3.apps.googleusercontent.com")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "https://drive-t0my.onrender.com/auth/google/callback")
 
 # Import Google auth libraries
 from google.oauth2 import id_token
@@ -101,7 +102,7 @@ class Folder(Base):
 
     id = Column(Integer, primary_key=True)
     name = Column(String, nullable=False)
-    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))  # Added this line
+    owner_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"))
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -130,13 +131,10 @@ class Folder(Base):
 
 # Create tables
 try:
-    Base.metadata.drop_all(bind=engine)
-    logger.info("Dropped existing tables")
+    Base.metadata.create_all(bind=engine)
+    logger.info("Tables created or already exist")
 except Exception as e:
-    logger.warning(f"Could not drop tables: {e}")
-
-Base.metadata.create_all(bind=engine)
-logger.info("Created new tables with BigInteger columns")
+    logger.error(f"Could not create tables: {e}")
 
 # Pydantic Models
 class UserBase(BaseModel):
@@ -166,6 +164,7 @@ class UserResponse(UserBase):
 class Token(BaseModel):
     access_token: str
     token_type: str
+    user: Optional[UserResponse] = None
 
 class TokenData(BaseModel):
     email: Optional[str] = None
@@ -228,7 +227,12 @@ class GoogleUserInfo(BaseModel):
     sub: str  # Google user ID
 
 class GoogleAuthRequest(BaseModel):
-    token: str
+    credential: str  # Changed from 'token' to 'credential'
+
+class GoogleAuthResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
 
 # Auth setup
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-this-in-production")
@@ -241,22 +245,33 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 app = FastAPI(title="Cloud Drive API")
 
-# Configure CORS
-# Update the CORS middleware configuration
+# Configure CORS - Updated with more permissive settings
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://dariusmumbere.github.io",
-        "http://localhost:5500",  # For local development
-        "http://127.0.0.1:5500",  # For local development
-        "http://localhost:3000",  # React/Vue dev server
-        "http://localhost:8000",  # Local backend
+        "http://localhost:5500",
+        "http://127.0.0.1:5500",
+        "http://localhost:3000",
+        "http://localhost:8000",
+        "http://localhost:8080",
+        "https://drive-t0my.onrender.com",
     ],
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-    allow_headers=["Authorization", "Content-Type", "Accept", "Origin", "X-Requested-With"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
+    allow_headers=[
+        "Authorization", 
+        "Content-Type", 
+        "Accept", 
+        "Origin", 
+        "X-Requested-With",
+        "X-CSRF-Token",
+        "Access-Control-Allow-Origin",
+        "Access-Control-Allow-Credentials",
+        "Access-Control-Allow-Headers"
+    ],
     expose_headers=["*"],
-    max_age=600,  # Cache preflight requests for 10 minutes
+    max_age=3600,
 )
 
 # Dependency
@@ -445,17 +460,77 @@ async def login_for_access_token(
     access_token = create_access_token(
         data={"sub": user.email}, expires_delta=access_token_expires
     )
-    return {"access_token": access_token, "token_type": "bearer"}
+    return Token(access_token=access_token, token_type="bearer", user=user)
 
-# Google OAuth Endpoints (using google.oauth2 instead of Authlib)
-@app.post("/auth/google")
+# Google OAuth Endpoints
+@app.post("/auth/google", response_model=GoogleAuthResponse)
 async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db)):
-    """Authenticate with Google token and redirect to frontend"""
-    token = payload.token
-    if not token:
-        raise HTTPException(status_code=400, detail="Token missing")
+    """Authenticate with Google token"""
+    credential = payload.credential
+    if not credential:
+        raise HTTPException(status_code=400, detail="Credential missing")
 
     try:
+        # Verify the Google token
+        info = id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID
+        )
+
+        # Create Google user info
+        google_user = GoogleUserInfo(
+            email=info["email"],
+            name=info.get("name", ""),
+            sub=info["sub"]
+        )
+        
+        # Create or update user in database
+        user = create_or_update_user_from_google(db, google_user)
+        
+        # Create JWT token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.email}, expires_delta=access_token_expires
+        )
+        
+        return GoogleAuthResponse(
+            access_token=access_token,
+            token_type="bearer",
+            user=user
+        )
+
+    except ValueError as e:
+        logger.error(f"Google token validation error: {str(e)}")
+        raise HTTPException(status_code=401, detail="Invalid Google token")
+    except Exception as e:
+        logger.error(f"Google authentication error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Authentication failed")
+
+# Google OAuth Callback for redirect flow
+@app.get("/auth/google/callback")
+async def google_auth_callback(
+    request: Request,
+    db: Session = Depends(get_db)
+):
+    """Handle Google OAuth callback from frontend"""
+    try:
+        # Get token from query parameters
+        token = request.query_params.get("token")
+        if not token:
+            return HTMLResponse(content="""
+            <html>
+                <body>
+                    <h2>Authentication Error</h2>
+                    <p>No token provided</p>
+                    <script>
+                        window.opener.postMessage({ error: "No token provided" }, "*");
+                        window.close();
+                    </script>
+                </body>
+            </html>
+            """)
+        
         # Verify the Google token
         info = id_token.verify_oauth2_token(
             token,
@@ -479,29 +554,104 @@ async def google_auth(payload: GoogleAuthRequest, db: Session = Depends(get_db))
             data={"sub": user.email}, expires_delta=access_token_expires
         )
         
-        # Instead of returning JSON, redirect to frontend with token in URL fragment
-        frontend_url = "https://dariusmumbere.github.io/cloud"
-        # You can pass the token as a query parameter or in the fragment
-        redirect_url = f"{frontend_url}#token={access_token}"
+        # Return HTML that sends message to opener and closes
+        return HTMLResponse(content=f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Authentication Complete</title>
+            <style>
+                body {{
+                    font-family: Arial, sans-serif;
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    height: 100vh;
+                    margin: 0;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                }}
+                .container {{
+                    background: white;
+                    padding: 40px;
+                    border-radius: 10px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.1);
+                    text-align: center;
+                }}
+                .success {{
+                    color: #4CAF50;
+                    font-size: 24px;
+                    margin-bottom: 20px;
+                }}
+                .loading {{
+                    margin-top: 20px;
+                    color: #666;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <div class="success">✓ Authentication Successful!</div>
+                <p>You will be redirected shortly...</p>
+                <div class="loading">Loading...</div>
+            </div>
+            <script>
+                // Send authentication data back to the opener window
+                const authData = {{
+                    access_token: "{access_token}",
+                    token_type: "bearer",
+                    user: {{
+                        id: {user.id},
+                        email: "{user.email}",
+                        full_name: "{user.full_name}",
+                        is_active: {str(user.is_active).lower()},
+                        storage_used: {user.storage_used},
+                        storage_limit: {user.storage_limit},
+                        created_at: "{user.created_at.isoformat() if user.created_at else ''}",
+                        auth_provider: "{user.auth_provider}"
+                    }}
+                }};
+                
+                window.opener.postMessage({{
+                    type: 'google-auth-success',
+                    data: authData
+                }}, "*");
+                
+                // Close the popup after 1 second
+                setTimeout(() => {{
+                    window.close();
+                }}, 1000);
+            </script>
+        </body>
+        </html>
+        """)
         
-        return RedirectResponse(url=redirect_url)
-
     except Exception as e:
-        logger.error(f"Google authentication error: {str(e)}")
-        raise HTTPException(status_code=401, detail="Invalid Google token")
-        
-# Google OAuth HTML page for testing
-@app.get("/auth/google")
+        logger.error(f"Google callback error: {str(e)}")
+        return HTMLResponse(content=f"""
+        <html>
+            <body>
+                <h2>Authentication Error</h2>
+                <p>Error: {str(e)}</p>
+                <script>
+                    window.opener.postMessage({{ type: 'google-auth-error', error: "{str(e)}" }}, "*");
+                    window.close();
+                </script>
+            </body>
+        </html>
+        """)
+
+# Google OAuth HTML page for direct testing
+@app.get("/auth/google/page")
 async def google_auth_page():
     """Generate HTML page for Google Sign-In button"""
-    html_content = """
+    html_content = f"""
     <!DOCTYPE html>
     <html>
     <head>
         <title>Google Sign-In</title>
         <script src="https://accounts.google.com/gsi/client" async defer></script>
         <style>
-            body {
+            body {{
                 font-family: Arial, sans-serif;
                 display: flex;
                 justify-content: center;
@@ -509,38 +659,23 @@ async def google_auth_page():
                 height: 100vh;
                 margin: 0;
                 background-color: #f5f5f5;
-            }
-            .container {
+            }}
+            .container {{
                 text-align: center;
                 background-color: white;
                 padding: 40px;
                 border-radius: 10px;
                 box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            }
-            #result {
-                margin-top: 20px;
-                padding: 10px;
-                border-radius: 5px;
-            }
-            .success {
-                background-color: #d4edda;
-                color: #155724;
-                border: 1px solid #c3e6cb;
-            }
-            .error {
-                background-color: #f8d7da;
-                color: #721c24;
-                border: 1px solid #f5c6cb;
-            }
+            }}
         </style>
     </head>
     <body>
         <div class="container">
             <h2>Sign in with Google</h2>
-            <p>This is a test page for Google Sign-In. After authentication, you will be redirected.</p>
+            <p>This is a test page for Google Sign-In.</p>
             
             <div id="g_id_onload"
-                data-client_id="%s"
+                data-client_id="{GOOGLE_CLIENT_ID}"
                 data-context="signin"
                 data-ux_mode="popup"
                 data-callback="handleCredentialResponse"
@@ -556,82 +691,42 @@ async def google_auth_page():
                 data-logo_alignment="left">
             </div>
             
-            <div id="result"></div>
+            <div id="result" style="margin-top: 20px;"></div>
         </div>
         
         <script>
-            function handleCredentialResponse(response) {
+            function handleCredentialResponse(response) {{
                 const resultDiv = document.getElementById('result');
                 resultDiv.innerHTML = '<p>Authenticating...</p>';
                 
-                // Send the credential to your backend
-                fetch('/auth/google', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({ token: response.credential })
-                })
-                .then(response => {
-                    if (!response.ok) {
-                        throw new Error('Authentication failed');
-                    }
-                    return response.json();
-                })
-                .then(data => {
-                    // Store the token and user info in localStorage
-                    localStorage.setItem('cloud_drive_token', data.access_token);
-                    localStorage.setItem('cloud_drive_user', JSON.stringify(data.user));
-                    
-                    resultDiv.innerHTML = '<p class="success">✅ Authentication successful! Redirecting...</p>';
-                    
-                    // Redirect to your application
-                    setTimeout(() => {
-                        // In a real app, redirect to your frontend
-                        window.location.href = '/';
-                    }, 2000);
-                })
-                .catch(error => {
-                    console.error('Error:', error);
-                    resultDiv.innerHTML = '<p class="error">❌ Authentication failed. Please try again.</p>';
-                });
-            }
+                // Send the credential to backend
+                fetch('/auth/google/callback?token=' + encodeURIComponent(response.credential))
+                    .then(response => response.text())
+                    .then(html => {{
+                        document.body.innerHTML = html;
+                    }})
+                    .catch(error => {{
+                        resultDiv.innerHTML = '<p style="color: red;">Authentication failed. Please try again.</p>';
+                        console.error('Error:', error);
+                    }});
+            }}
+            
+            // Initialize Google Sign-In
+            window.onload = function() {{
+                google.accounts.id.initialize({{
+                    client_id: '{GOOGLE_CLIENT_ID}',
+                    callback: handleCredentialResponse
+                }});
+                google.accounts.id.renderButton(
+                    document.querySelector('.g_id_signin'),
+                    {{ theme: "outline", size: "large" }}
+                );
+            }};
         </script>
     </body>
     </html>
-    """ % GOOGLE_CLIENT_ID
+    """
     return HTMLResponse(content=html_content)
-
-# Alternative endpoint for frontend redirect (optional - for callback URL)
-@app.get("/auth/google/callback")
-async def google_auth_callback(
-    code: Optional[str] = None,
-    error: Optional[str] = None,
-    state: Optional[str] = None
-):
-    """Handle Google OAuth callback (for server-side flow)"""
-    if error:
-        return HTMLResponse(content=f"""
-        <html>
-            <body>
-                <h2>Authentication Error</h2>
-                <p>Error: {error}</p>
-                <a href="/auth/google">Try again</a>
-            </body>
-        </html>
-        """)
-    
-    return HTMLResponse(content=f"""
-    <html>
-        <body>
-            <h2>Google OAuth Callback</h2>
-            <p>This endpoint is for server-side OAuth flow.</p>
-            <p>For client-side flow with Google Sign-In button, use the main <a href="/auth/google">Google Sign-In page</a>.</p>
-            <p>Code: {code}</p>
-            <p>State: {state}</p>
-        </body>
-    </html>
-    """)
 
 @app.post("/users/", response_model=UserResponse)
 def create_user(user: UserCreate, db: Session = Depends(get_db)):
@@ -1230,6 +1325,20 @@ def health_check():
     """Health check endpoint"""
     return {"status": "healthy", "timestamp": datetime.utcnow()}
 
+# Preflight OPTIONS handler
+@app.options("/{rest_of_path:path}")
+async def preflight_handler(rest_of_path: str):
+    """Handle preflight OPTIONS requests"""
+    return JSONResponse(
+        status_code=200,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS, PATCH",
+            "Access-Control-Allow-Headers": "Authorization, Content-Type, Accept, Origin, X-Requested-With",
+            "Access-Control-Allow-Credentials": "true",
+        }
+    )
+
 # Root endpoint
 @app.get("/")
 def read_root():
@@ -1238,21 +1347,8 @@ def read_root():
         "message": "Cloud Drive API",
         "version": "1.0.0",
         "documentation": "/docs",
-        "endpoints": {
-            "auth": [
-                "POST /token", 
-                "POST /users/", 
-                "GET /users/me/", 
-                "GET /auth/google (HTML page)", 
-                "POST /auth/google (API endpoint)",
-                "GET /auth/google/callback"
-            ],
-            "files": ["POST /files/upload", "GET /files", "GET /files/{id}", "DELETE /files/{id}"],
-            "folders": ["POST /folders/", "GET /folders", "GET /folders/{id}", "DELETE /folders/{id}"],
-            "storage": ["GET /storage/info"],
-            "search": ["GET /search"],
-            "sharing": ["GET /public/files/{id}", "PUT /files/{id}/share"]
-        }
+        "status": "running",
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 if __name__ == "__main__":
