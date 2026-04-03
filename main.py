@@ -48,7 +48,7 @@ b2_client = boto3.client(
 # Google OAuth Configuration
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "304984836974-0o5rdilg1pdvg3almd5js4b42je8p6e3.apps.googleusercontent.com")
 GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET")
-GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "https://drive-t0my.onrender.com/auth/google/callback")
+GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI", "https://drive-1-r8nr.onrender.com/auth/google/callback")
 
 # Import Google auth libraries
 from google.oauth2 import id_token
@@ -68,8 +68,7 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String, nullable=True)  # Nullable for Google OAuth users
-    full_name = Column(String)
-    is_active = Column(Boolean, default=True)
+    full_name = Co=True)
     storage_used = Column(BigInteger, default=0)
     storage_limit = Column(BigInteger, default=10737418240)  # 10GB in bytes
     created_at = Column(DateTime, default=datetime.utcnow)
