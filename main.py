@@ -1351,7 +1351,6 @@ def read_root():
         "timestamp": datetime.utcnow().isoformat()
     }
 
-python
 # At the very bottom of your main.py, replace the if __name__ == "__main__" block with:
 
 if __name__ == "__main__":
