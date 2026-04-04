@@ -68,7 +68,8 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     email = Column(String, unique=True, index=True)
     hashed_password = Column(String, nullable=True)  # Nullable for Google OAuth users
-    full_name = Co=True)
+    full_name = Column(String)  # Fixed this line
+    is_active = Column(Boolean, default=True)
     storage_used = Column(BigInteger, default=0)
     storage_limit = Column(BigInteger, default=10737418240)  # 10GB in bytes
     created_at = Column(DateTime, default=datetime.utcnow)
