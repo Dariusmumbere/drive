@@ -1350,8 +1350,32 @@ def read_root():
         "timestamp": datetime.utcnow().isoformat()
     }
 
+python
+# At the very bottom of your main.py, replace the if __name__ == "__main__" block with:
+
 if __name__ == "__main__":
     import uvicorn
     
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    # Fix for asyncio event loop issues
+    try:
+        uvicorn.run(
+            app, 
+            host="0.0.0.0", 
+            port=port,
+            reload=False,  # Set to False in production
+            loop="asyncio",  # Explicitly set loop type
+            workers=1  # Start with 1 worker
+        )
+    except RuntimeError as e:
+        if "asyncio.run() cannot be called from a running event loop" in str(e):
+            # Alternative approach for running in existing event loop
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            config = uvicorn.Config(app, host="0.0.0.0", port=port)
+            server = uvicorn.Server(config)
+            loop.run_until_complete(server.serve())
+        else:
+            raise
