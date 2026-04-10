@@ -256,6 +256,7 @@ app.add_middleware(
         "http://localhost:8000",
         "http://localhost:8080",
         "https://drive-t0my.onrender.com",
+        "https://www.barwodawomen.org",
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH", "HEAD"],
