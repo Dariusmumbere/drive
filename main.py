@@ -55,7 +55,7 @@ from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 
 # Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://drive_r5j8_user:5GwzlQ6IImmfbsKCjb2rvWamf1qk40GI@dpg-d7821914bi0s73f8o7m0-a/drive_r5j8")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://neondb_owner:npg_P17VUlbXkFAW@ep-green-wildflower-atg55v8d.c-9.us-east-1.aws.neon.tech/neondb?sslmode=require")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
